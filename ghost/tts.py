@@ -1,7 +1,7 @@
+import io
 import os
 import queue
 import re
-import struct
 import subprocess
 import tempfile
 import threading
@@ -17,7 +17,7 @@ _VOICES = os.path.join(_BASE, "models", "voices-v1.0.bin")
 VOICE = "af_heart"
 SPEED = 1.0
 LANG = "en-us"
-MAX_CHARS = 150  # Kokoro can loop on long inputs; split at this threshold
+MAX_CHARS = 150
 
 _NORMALIZE = [
     (re.compile(r'(\d+)\s*°F\b'), r'\1 degrees Fahrenheit'),
@@ -36,6 +36,10 @@ _NORMALIZE = [
 
 _CLAUSE_SPLIT = re.compile(r',\s+')
 
+# Shared model instance — loaded once, used by both local and server modes
+_kokoro = Kokoro(_MODEL, _VOICES)
+_kokoro.create("Ready.", voice=VOICE, speed=SPEED, lang=LANG)  # warmup
+
 
 def clean_for_speech(text: str) -> str:
     for pattern, replacement in _NORMALIZE:
@@ -44,7 +48,6 @@ def clean_for_speech(text: str) -> str:
 
 
 def _chunk_text(text: str) -> list[str]:
-    """Split long text at clause boundaries to stay under MAX_CHARS."""
     if len(text) <= MAX_CHARS:
         return [text]
     parts = _CLAUSE_SPLIT.split(text)
@@ -63,7 +66,6 @@ def _chunk_text(text: str) -> list[str]:
 
 
 def _fade(samples: np.ndarray, sr: int, ms: int = 8) -> np.ndarray:
-    """Apply a short linear fade-in to remove leading transient clicks."""
     n = int(sr * ms / 1000)
     if len(samples) <= n:
         return samples
@@ -73,22 +75,37 @@ def _fade(samples: np.ndarray, sr: int, ms: int = 8) -> np.ndarray:
     return out
 
 
-def _write_wav(samples: np.ndarray, sr: int, path: str) -> None:
+def _to_wav(samples: np.ndarray, sr: int, dest) -> None:
+    """Write float32 samples to a WAV file path or file-like object."""
     samples = _fade(samples, sr)
     int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-    with wave.open(path, 'wb') as wf:
+    with wave.open(dest, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(int16.tobytes())
 
 
+def synthesize_to_bytes(text: str) -> bytes:
+    """Synthesize text → WAV bytes. Used by the web server to stream audio to browsers."""
+    cleaned = clean_for_speech(text)
+    if not cleaned:
+        return b""
+    all_samples: list = []
+    sr_out = 24000
+    for chunk in _chunk_text(cleaned):
+        samples, sr_out = _kokoro.create(chunk, voice=VOICE, speed=SPEED, lang=LANG)
+        all_samples.extend(samples)
+    buf = io.BytesIO()
+    _to_wav(np.array(all_samples, dtype=np.float32), sr_out, buf)
+    return buf.getvalue()
+
+
 def _afplay(samples: np.ndarray, sr: int) -> None:
-    """Play audio via macOS afplay — no PortAudio, no echo issues."""
     fd, path = tempfile.mkstemp(suffix='.wav')
     os.close(fd)
     try:
-        _write_wav(samples, sr, path)
+        _to_wav(samples, sr, path)
         subprocess.run(['afplay', path], check=True)
     finally:
         os.unlink(path)
@@ -96,15 +113,11 @@ def _afplay(samples: np.ndarray, sr: int) -> None:
 
 class KokoroTTS:
     """
-    Kokoro ONNX TTS with afplay-based playback (macOS native).
-
-    say() synthesizes in the calling thread, hands audio to a background
-    afplay process.  Sentence N plays while sentence N+1 is synthesized.
-    finish() blocks until all queued audio has been spoken.
+    Local TTS for voice_main.py. Synthesis in calling thread, playback via
+    background afplay so sentence N plays while sentence N+1 is synthesized.
     """
 
     def __init__(self) -> None:
-        self._kokoro = Kokoro(_MODEL, _VOICES)
         self._audio_q: queue.Queue = queue.Queue()
         self._pending = 0
         self._lock = threading.Lock()
@@ -112,7 +125,6 @@ class KokoroTTS:
         self._all_done.set()
         self._player = threading.Thread(target=self._play_loop, daemon=True)
         self._player.start()
-        self._kokoro.create("Ready.", voice=VOICE, speed=SPEED, lang=LANG)
 
     def _play_loop(self) -> None:
         while True:
@@ -131,7 +143,7 @@ class KokoroTTS:
             with self._lock:
                 self._pending += 1
                 self._all_done.clear()
-            samples, sr = self._kokoro.create(chunk, voice=VOICE, speed=SPEED, lang=LANG)
+            samples, sr = _kokoro.create(chunk, voice=VOICE, speed=SPEED, lang=LANG)
             self._audio_q.put((np.array(samples, dtype=np.float32), sr))
 
     def finish(self) -> None:

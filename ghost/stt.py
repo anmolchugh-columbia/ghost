@@ -61,5 +61,5 @@ def record_with_vad() -> np.ndarray:
 def transcribe(audio: np.ndarray) -> str:
     if audio.size == 0:
         return ""
-    result = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, verbose=False)
+    result = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, language="en", verbose=False)
     return result["text"].strip()
