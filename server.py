@@ -18,9 +18,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from ghost.agent import chat_stream
+from ghost.agent import chat_stream, route
 from ghost.stt import transcribe
 from ghost.tts import synthesize_to_bytes
+
+_FILLER_WAV: bytes = b""  # pre-synthesized once at startup
 
 STATIC = Path(__file__).parent / "static"
 
@@ -28,6 +30,13 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 _busy = False  # one conversation at a time
+
+
+@app.on_event("startup")
+async def _startup():
+    global _FILLER_WAV
+    loop = asyncio.get_running_loop()
+    _FILLER_WAV = await loop.run_in_executor(None, synthesize_to_bytes, "Let me look that up.")
 
 _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
@@ -91,12 +100,24 @@ async def ws_handler(ws: WebSocket):
 
             await ws.send_json({"type": "transcript", "text": user_text})
 
-            # LLM streams in a thread; sentences arrive via queue
+            # Pre-route so we can send filler immediately on search queries
+            needs_search, search_query = await loop.run_in_executor(None, route, user_text)
+
+            if needs_search:
+                await ws.send_json({
+                    "type": "sentence",
+                    "text": "Let me look that up.",
+                    "audio": base64.b64encode(_FILLER_WAV).decode(),
+                })
+
+            # LLM streams sentences into sentence_q (background thread)
             sentence_q: queue.Queue = queue.Queue()
 
             def generate():
                 try:
-                    for s in _iter_sentences(chat_stream(history, user_text)):
+                    for s in _iter_sentences(
+                        chat_stream(history, user_text, routing=(needs_search, search_query))
+                    ):
                         sentence_q.put(s)
                 except Exception as exc:
                     sentence_q.put(exc)
@@ -105,18 +126,32 @@ async def ws_handler(ws: WebSocket):
 
             threading.Thread(target=generate, daemon=True).start()
 
+            # Synthesis thread: consumes sentence_q, synthesizes, feeds synthesis_q.
+            # Sentence N+1 is synthesized while sentence N is being sent over the WebSocket.
+            synthesis_q: queue.Queue = queue.Queue()
+
+            def synthesize_loop():
+                while True:
+                    item = sentence_q.get()
+                    if item is None or isinstance(item, Exception):
+                        synthesis_q.put(item)
+                        break
+                    synthesis_q.put((item, synthesize_to_bytes(item)))
+
+            threading.Thread(target=synthesize_loop, daemon=True).start()
+
             while True:
-                item = await loop.run_in_executor(None, sentence_q.get)
+                item = await loop.run_in_executor(None, synthesis_q.get)
                 if item is None:
                     break
                 if isinstance(item, Exception):
                     await ws.send_json({"type": "error", "message": str(item)})
                     break
 
-                wav = await loop.run_in_executor(None, synthesize_to_bytes, item)
+                sentence, wav = item
                 await ws.send_json({
                     "type": "sentence",
-                    "text": item,
+                    "text": sentence,
                     "audio": base64.b64encode(wav).decode(),
                 })
 

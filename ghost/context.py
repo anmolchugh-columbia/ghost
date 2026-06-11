@@ -28,6 +28,7 @@ VOICE FORMAT — you are speaking aloud, not displaying text:
 - Spell out units naturally: "72 degrees Fahrenheit", not "72°F"
 - Be concise — 1-4 sentences unless detail is asked for
 - Never reference URLs or say "check this link" — summarize what you found
+- ALWAYS lead with a SHORT first sentence of 10 words or fewer — it reaches the user first
 
 Here is {OWNER_NAME}'s profile for context:
 {load_profile()}

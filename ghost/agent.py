@@ -27,10 +27,11 @@ Examples:
 """
 
 
-def _route(query: str) -> tuple[bool, str]:
+def route(query: str) -> tuple[bool, str]:
     """
     Ask the router model whether this query needs a web search.
     Returns (needs_search, search_query). Runs in ~200-400ms on qwen3:0.6b.
+    Public so server.py can pre-route before spawning the generate thread.
     """
     resp = ollama.chat(
         model=ROUTER_MODEL,
@@ -55,19 +56,25 @@ def _route(query: str) -> tuple[bool, str]:
         return False, ""
 
 
-def chat_stream(history: list[dict], user_input: str) -> Generator[str, None, None]:
+def chat_stream(
+    history: list[dict],
+    user_input: str,
+    routing: tuple[bool, str] | None = None,
+) -> Generator[str, None, None]:
     """
     Route → (search) → stream.
 
-    The router model decides if a web search is needed and formulates a clean
-    query. If yes, the search runs before the main LLM call so results are
-    injected into context and the main model streams with think=False immediately.
-    No buffering — first token arrives as soon as the LLM starts generating.
+    If `routing` is provided (pre-computed by the caller), the internal route()
+    call is skipped — avoids double-routing when server.py pre-routes to send
+    a filler phrase before the generate thread starts.
     """
     history.append({"role": "user", "content": user_input})
 
     # ── 1. Route ──────────────────────────────────────────────────────────────
-    needs_search, search_query = _route(user_input)
+    if routing is not None:
+        needs_search, search_query = routing
+    else:
+        needs_search, search_query = route(user_input)
     print(f"[router] needs_search={needs_search}  query={search_query!r}", flush=True)
 
     # ── 2. Search ─────────────────────────────────────────────────────────────
