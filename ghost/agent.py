@@ -1,107 +1,99 @@
 from collections.abc import Generator
+import json
 import ollama
 from ghost.context import SYSTEM_PROMPT
 from tools.search import web_search
 
-MODEL = "qwen3:14b"
+ROUTER_MODEL = "qwen3:0.6b"
+MAIN_MODEL   = "qwen3:14b"
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for current information, news, or facts you don't know.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"}
-                },
-                "required": ["query"],
+# Few-shot prompt — small models follow examples far more reliably than abstract rules.
+_ROUTER_SYSTEM = """\
+Decide if a web search is needed. Output JSON only, no other text.
+
+Format: {"needs_search": true, "search_query": "..."} or {"needs_search": false, "search_query": ""}
+
+Examples:
+"What's the weather in NYC?" → {"needs_search": true, "search_query": "weather New York City today"}
+"Who is Elon Musk?" → {"needs_search": true, "search_query": "Elon Musk"}
+"What movies are out this week?" → {"needs_search": true, "search_query": "movies released this week"}
+"Latest news on Apple?" → {"needs_search": true, "search_query": "Apple news today"}
+"What is the capital of France?" → {"needs_search": true, "search_query": "capital of France"}
+"Hello, how are you?" → {"needs_search": false, "search_query": ""}
+"What is 15 percent of 240?" → {"needs_search": false, "search_query": ""}
+"Should I walk or drive 50 metres?" → {"needs_search": false, "search_query": ""}
+"What can you do?" → {"needs_search": false, "search_query": ""}
+"Tell me a joke." → {"needs_search": false, "search_query": ""}\
+"""
+
+
+def _route(query: str) -> tuple[bool, str]:
+    """
+    Ask the router model whether this query needs a web search.
+    Returns (needs_search, search_query). Runs in ~200-400ms on qwen3:0.6b.
+    """
+    resp = ollama.chat(
+        model=ROUTER_MODEL,
+        messages=[
+            {"role": "system", "content": _ROUTER_SYSTEM},
+            {"role": "user",   "content": query},
+        ],
+        think=False,
+        format={
+            "type": "object",
+            "properties": {
+                "needs_search":  {"type": "boolean"},
+                "search_query":  {"type": "string"},
             },
+            "required": ["needs_search", "search_query"],
         },
-    }
-]
-
-
-def run_tool(name: str, args: dict) -> str:
-    if name == "web_search":
-        print(f"[tool] web_search({args['query']!r})", flush=True)
-        return web_search(args["query"])
-    return f"Unknown tool: {name}"
+    )
+    try:
+        data = json.loads(resp.message.content)
+        return bool(data.get("needs_search")), data.get("search_query", "").strip()
+    except Exception:
+        return False, ""
 
 
 def chat_stream(history: list[dict], user_input: str) -> Generator[str, None, None]:
     """
-    Yields text tokens as the LLM generates them.
+    Route → (search) → stream.
 
-    First pass uses think='low' — a small reasoning budget that lets the model
-    decide whether to call web_search and formulate a good query, without the
-    15-20 second cost of full thinking. Follow-up passes (after tool results are
-    in context) use think=False since synthesis needs no deliberation.
-
-    First pass is buffered: we don't yield tokens until we know whether a tool
-    call is coming, so hallucinated content never reaches TTS.
+    The router model decides if a web search is needed and formulates a clean
+    query. If yes, the search runs before the main LLM call so results are
+    injected into context and the main model streams with think=False immediately.
+    No buffering — first token arrives as soon as the LLM starts generating.
     """
     history.append({"role": "user", "content": user_input})
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    # ── 1. Route ──────────────────────────────────────────────────────────────
+    needs_search, search_query = _route(user_input)
+    print(f"[router] needs_search={needs_search}  query={search_query!r}", flush=True)
 
-    # First pass — buffered, minimal thinking to drive tool-call decisions
+    # ── 2. Search ─────────────────────────────────────────────────────────────
+    extra = ""
+    if needs_search and search_query:
+        try:
+            results = web_search(search_query)
+            print(f"[search] {search_query!r}", flush=True)
+            extra = f"\n\nFresh web search results:\n{results}"
+        except Exception as exc:
+            print(f"[search error] {exc}", flush=True)
+
+    # ── 3. Stream ─────────────────────────────────────────────────────────────
+    messages = [{"role": "system", "content": SYSTEM_PROMPT + extra}] + history
     stream = ollama.chat(
-        model=MODEL,
+        model=MAIN_MODEL,
         messages=messages,
-        tools=TOOLS,
-        think="low",
+        think=False,
         stream=True,
     )
 
     accumulated = ""
-    tool_calls = []
-
     for chunk in stream:
         delta = chunk.message.content or ""
         if delta:
             accumulated += delta
-        if chunk.message.tool_calls:
-            tool_calls = chunk.message.tool_calls
-
-    if not tool_calls:
-        # No tool needed — release the buffer
-        history.append({"role": "assistant", "content": accumulated})
-        yield accumulated
-        return
-
-    # Tool call path — execute, then stream the final response
-    while tool_calls:
-        history.append({
-            "role": "assistant",
-            "content": accumulated,
-            "tool_calls": [
-                {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in tool_calls
-            ],
-        })
-        for tc in tool_calls:
-            result = run_tool(tc.function.name, tc.function.arguments)
-            history.append({"role": "tool", "content": result})
-
-        accumulated = ""
-        tool_calls = []
-
-        # Follow-up: stream directly, no thinking needed
-        stream = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-            tools=TOOLS,
-            think=False,
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.message.content or ""
-            if delta:
-                accumulated += delta
-                yield delta
-            if chunk.message.tool_calls:
-                tool_calls = chunk.message.tool_calls
+            yield delta
 
     history.append({"role": "assistant", "content": accumulated})
