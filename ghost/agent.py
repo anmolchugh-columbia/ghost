@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from datetime import datetime
 import json
 import ollama
 from ghost.context import SYSTEM_PROMPT
@@ -15,15 +16,26 @@ Format: {"needs_search": true, "search_query": "..."} or {"needs_search": false,
 
 Examples:
 "What's the weather in NYC?" → {"needs_search": true, "search_query": "weather New York City today"}
+"What's the weather like right now in Sunnyvale?" → {"needs_search": true, "search_query": "weather Sunnyvale"}
+"What's the weather in London right now?" → {"needs_search": true, "search_query": "weather London today"}
 "Who is Elon Musk?" → {"needs_search": true, "search_query": "Elon Musk"}
+"Who is Andrej Karpathy?" → {"needs_search": true, "search_query": "Andrej Karpathy"}
 "What movies are out this week?" → {"needs_search": true, "search_query": "movies released this week"}
+"What do you know about the movie Inception?" → {"needs_search": true, "search_query": "movie Inception"}
 "Latest news on Apple?" → {"needs_search": true, "search_query": "Apple news today"}
 "What is the capital of France?" → {"needs_search": true, "search_query": "capital of France"}
 "Hello, how are you?" → {"needs_search": false, "search_query": ""}
 "What is 15 percent of 240?" → {"needs_search": false, "search_query": ""}
 "Should I walk or drive 50 metres?" → {"needs_search": false, "search_query": ""}
+"How many R's are in strawberry?" → {"needs_search": false, "search_query": ""}
+"How many hours are in a day?" → {"needs_search": false, "search_query": ""}
 "What can you do?" → {"needs_search": false, "search_query": ""}
-"Tell me a joke." → {"needs_search": false, "search_query": ""}\
+"Tell me a joke." → {"needs_search": false, "search_query": ""}
+"Who am I?" → {"needs_search": false, "search_query": ""}
+"What's my background?" → {"needs_search": false, "search_query": ""}
+"What time is it?" → {"needs_search": false, "search_query": ""}
+"What time is it right now?" → {"needs_search": false, "search_query": ""}
+"What time is it in Tokyo?" → {"needs_search": false, "search_query": ""}\
 """
 
 
@@ -40,6 +52,7 @@ def route(query: str) -> tuple[bool, str]:
             {"role": "user",   "content": query},
         ],
         think=False,
+        options={"temperature": 0},
         format={
             "type": "object",
             "properties": {
@@ -60,6 +73,7 @@ def chat_stream(
     history: list[dict],
     user_input: str,
     routing: tuple[bool, str] | None = None,
+    prefetched_results: str | None = None,
 ) -> Generator[str, None, None]:
     """
     Route → (search) → stream.
@@ -78,14 +92,18 @@ def chat_stream(
     print(f"[router] needs_search={needs_search}  query={search_query!r}", flush=True)
 
     # ── 2. Search ─────────────────────────────────────────────────────────────
-    extra = ""
+    now = datetime.now().astimezone()
+    extra = f"\n\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p %Z')}"
     if needs_search and search_query:
-        try:
-            results = web_search(search_query)
-            print(f"[search] {search_query!r}", flush=True)
-            extra = f"\n\nFresh web search results:\n{results}"
-        except Exception as exc:
-            print(f"[search error] {exc}", flush=True)
+        if prefetched_results is not None:
+            extra += f"\n\nFresh web search results:\n{prefetched_results}"
+        else:
+            try:
+                results = web_search(search_query)
+                print(f"[search] {search_query!r}", flush=True)
+                extra += f"\n\nFresh web search results:\n{results}"
+            except Exception as exc:
+                print(f"[search error] {exc}", flush=True)
 
     # ── 3. Stream ─────────────────────────────────────────────────────────────
     messages = [{"role": "system", "content": SYSTEM_PROMPT + extra}] + history

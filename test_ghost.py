@@ -37,6 +37,8 @@ TEST_CASES = [
     ("Hello, how are you doing today?",                                                "conversational / greeting", False),
     ("I need to wash my car. The car wash is 50 metres away. Should I walk or drive?", "reasoning / car wash",      False),
     ("What is 15 percent of 240?",                                                     "math / no search",          False),
+    ("Who am I?",                                                                      "profile / identity",        False),
+    ("What time is it right now?",                                                     "time / no search",          False),
 ]
 
 # Mirrors server.py's _SENTENCE_RE / _iter_sentences exactly

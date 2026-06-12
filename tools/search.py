@@ -1,15 +1,21 @@
-from ddgs import DDGS
+import os
 
-_MAX_BODY = 200  # chars per result — enough context, fewer LLM tokens
+import requests
+
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8080")
 
 
 def web_search(query: str, max_results: int = 3) -> str:
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
+    resp = requests.get(
+        f"{SEARXNG_URL}/search",
+        params={"q": query, "format": "json", "categories": "general"},
+        timeout=8,
+    ).json()
+    results = resp.get("results", [])[:max_results]
     if not results:
         return "No results found."
     lines = []
     for r in results:
-        body = r["body"][:_MAX_BODY]
-        lines.append(f"{r['title']}: {body}")
+        snippet = (r.get("content") or "")[:250]
+        lines.append(f"{r['title']}: {snippet}")
     return "\n\n".join(lines)

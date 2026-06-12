@@ -21,6 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from ghost.agent import chat_stream, route
 from ghost.stt import transcribe
 from ghost.tts import synthesize_to_bytes
+from tools.search import web_search
+from tools.searxng import start as _searxng_start, stop as _searxng_stop
 
 _FILLER_WAV: bytes = b""  # pre-synthesized once at startup
 
@@ -36,7 +38,14 @@ _busy = False  # one conversation at a time
 async def _startup():
     global _FILLER_WAV
     loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _searxng_start)
     _FILLER_WAV = await loop.run_in_executor(None, synthesize_to_bytes, "Let me look that up.")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _searxng_stop)
 
 _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
@@ -100,15 +109,22 @@ async def ws_handler(ws: WebSocket):
 
             await ws.send_json({"type": "transcript", "text": user_text})
 
-            # Pre-route so we can send filler immediately on search queries
+            # Pre-route so we can overlap search with filler when search is slow
             needs_search, search_query = await loop.run_in_executor(None, route, user_text)
 
-            if needs_search:
-                await ws.send_json({
-                    "type": "sentence",
-                    "text": "Let me look that up.",
-                    "audio": base64.b64encode(_FILLER_WAV).decode(),
-                })
+            # Run search in background; only send filler if it takes > 1.5s
+            prefetched: str | None = None
+            if needs_search and search_query:
+                search_task = loop.run_in_executor(None, web_search, search_query)
+                try:
+                    prefetched = await asyncio.wait_for(asyncio.shield(search_task), timeout=1.5)
+                except asyncio.TimeoutError:
+                    await ws.send_json({
+                        "type": "sentence",
+                        "text": "Let me look that up.",
+                        "audio": base64.b64encode(_FILLER_WAV).decode(),
+                    })
+                    prefetched = await search_task
 
             # LLM streams sentences into sentence_q (background thread)
             sentence_q: queue.Queue = queue.Queue()
@@ -116,7 +132,11 @@ async def ws_handler(ws: WebSocket):
             def generate():
                 try:
                     for s in _iter_sentences(
-                        chat_stream(history, user_text, routing=(needs_search, search_query))
+                        chat_stream(
+                            history, user_text,
+                            routing=(needs_search, search_query),
+                            prefetched_results=prefetched,
+                        )
                     ):
                         sentence_q.put(s)
                 except Exception as exc:

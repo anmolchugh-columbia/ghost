@@ -1,0 +1,13 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - google
+
+server:
+  secret_key: "ghost-searxng-secret-key-change-in-prod"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json
