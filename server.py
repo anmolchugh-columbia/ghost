@@ -91,6 +91,7 @@ async def ws_handler(ws: WebSocket):
     _busy = True
     history = []
     loop = asyncio.get_running_loop()
+    stop = threading.Event()  # signals background threads to exit on disconnect
 
     try:
         while True:
@@ -138,6 +139,8 @@ async def ws_handler(ws: WebSocket):
                             prefetched_results=prefetched,
                         )
                     ):
+                        if stop.is_set():
+                            break
                         sentence_q.put(s)
                 except Exception as exc:
                     sentence_q.put(exc)
@@ -152,7 +155,13 @@ async def ws_handler(ws: WebSocket):
 
             def synthesize_loop():
                 while True:
-                    item = sentence_q.get()
+                    try:
+                        item = sentence_q.get(timeout=0.5)
+                    except queue.Empty:
+                        if stop.is_set():
+                            synthesis_q.put(None)
+                            break
+                        continue
                     if item is None or isinstance(item, Exception):
                         synthesis_q.put(item)
                         break
@@ -160,8 +169,16 @@ async def ws_handler(ws: WebSocket):
 
             threading.Thread(target=synthesize_loop, daemon=True).start()
 
+            def _get_synthesized():
+                while not stop.is_set():
+                    try:
+                        return synthesis_q.get(timeout=0.5)
+                    except queue.Empty:
+                        pass
+                return None
+
             while True:
-                item = await loop.run_in_executor(None, synthesis_q.get)
+                item = await loop.run_in_executor(None, _get_synthesized)
                 if item is None:
                     break
                 if isinstance(item, Exception):
@@ -182,4 +199,5 @@ async def ws_handler(ws: WebSocket):
     except asyncio.CancelledError:
         pass
     finally:
+        stop.set()  # unblock background threads immediately
         _busy = False
